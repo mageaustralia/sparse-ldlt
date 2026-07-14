@@ -1,0 +1,385 @@
+//! Pure-Rust, dependency-free sparse **symmetric-indefinite** LDLᵀ factorization.
+//!
+//! Factors a symmetric sparse matrix `A = L D Lᵀ`, where `L` is unit-lower-triangular
+//! and `D` is a **signed** diagonal, then solves `A x = b`. Because `D` may carry
+//! negative entries, this handles symmetric **indefinite** systems (KKT / saddle-point
+//! problems, shifted eigenvalue matrices `K - σM`, quasi-definite systems) - not just
+//! positive-definite ones - and it exposes `D` so you can read the matrix **inertia**
+//! (the number of negative eigenvalues, by Sylvester's law) for Sturm eigenvalue counts.
+//!
+//! Most pure-Rust sparse factorizations only offer positive-definite Cholesky and do not
+//! expose the signed pivots; this crate fills that gap with a small, self-contained
+//! implementation of the standard up-looking sparse LDLᵀ (elimination-tree) method
+//! described in T. A. Davis, *Direct Methods for Sparse Linear Systems* (SIAM, 2006).
+//!
+//! It has **no dependencies** and works on stable Rust. The matrix is supplied in
+//! compressed-sparse-column (CSC) form; only the upper triangle (entries with row ≤ col
+//! in each column) is read, so a fully-populated symmetric matrix is also accepted.
+//!
+//! No pivoting is performed: like every un-pivoted LDLᵀ it breaks down (returns
+//! [`LdltError::ZeroPivot`]) if a diagonal entry of `D` reaches zero. For a matrix on a
+//! near-singular point (e.g. a shift landing on an eigenvalue) nudge the shift and retry.
+//!
+//! # Example
+//! ```
+//! use sparse_ldlt::SparseLdlt;
+//! // Symmetric indefinite 3x3 matrix (full storage), CSC:
+//! //   [ 2  1  0 ]
+//! //   [ 1 -3  1 ]
+//! //   [ 0  1  2 ]
+//! let col_ptr = vec![0, 2, 5, 7];
+//! let row_idx = vec![0, 1,  0, 1, 2,  1, 2];
+//! let values  = vec![2.0, 1.0,  1.0, -3.0, 1.0,  1.0, 2.0];
+//! let f = SparseLdlt::factor(3, &col_ptr, &row_idx, &values).unwrap();
+//! let x = f.solve(&[1.0, 2.0, 3.0]);
+//! // one negative pivot => one negative eigenvalue (inertia)
+//! assert_eq!(f.d().iter().filter(|&&v| v < 0.0).count(), 1);
+//! # let _ = x;
+//! ```
+
+#![forbid(unsafe_code)]
+// Sparse CSC factorization is inherently index-driven (column ranges index parallel
+// indices/values arrays); range loops are clearer here than iterator gymnastics.
+#![allow(clippy::needless_range_loop)]
+
+/// Failure modes of the factorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LdltError {
+    /// A zero pivot (`D[k] == 0`) was hit at this column: the matrix is singular or the
+    /// un-pivoted factorization broke down there.
+    ZeroPivot(usize),
+    /// The CSC arrays were inconsistent (bad length, `col_ptr` not monotonic, or an index
+    /// out of range).
+    InvalidInput(&'static str),
+}
+
+/// An `L D Lᵀ` factorization of a symmetric matrix.
+///
+/// `L` is stored in CSC by column with an **implicit** unit diagonal (only the strictly
+/// lower entries are kept); `d` is the signed diagonal of `D`.
+#[derive(Debug, Clone)]
+pub struct SparseLdlt {
+    n: usize,
+    lp: Vec<usize>, // column pointers of L, length n+1
+    li: Vec<usize>, // row indices of the strictly-lower entries of L
+    lx: Vec<f64>,   // values matching li
+    d: Vec<f64>,    // signed diagonal of D, length n
+}
+
+impl SparseLdlt {
+    /// Factor a symmetric `n x n` matrix supplied in CSC form.
+    ///
+    /// - `col_ptr` has length `n + 1`; column `k` occupies `col_ptr[k]..col_ptr[k+1]`.
+    /// - `row_idx` and `values` are parallel arrays of the nonzeros (any row order).
+    ///
+    /// Only the upper triangle (entries with row ≤ col) is read; a fully symmetric
+    /// matrix works too. No fill-reducing reordering is applied - permute the matrix
+    /// first if you want one (RCM, AMD, nested dissection, ...).
+    pub fn factor(
+        n: usize,
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        values: &[f64],
+    ) -> Result<Self, LdltError> {
+        if col_ptr.len() != n + 1 {
+            return Err(LdltError::InvalidInput("col_ptr length must be n + 1"));
+        }
+        if row_idx.len() != values.len() {
+            return Err(LdltError::InvalidInput("row_idx and values length mismatch"));
+        }
+        if col_ptr[n] != row_idx.len() {
+            return Err(LdltError::InvalidInput("col_ptr[n] must equal the nonzero count"));
+        }
+        for k in 0..n {
+            if col_ptr[k] > col_ptr[k + 1] {
+                return Err(LdltError::InvalidInput("col_ptr must be non-decreasing"));
+            }
+        }
+        for &r in row_idx {
+            if r >= n {
+                return Err(LdltError::InvalidInput("row index out of range"));
+            }
+        }
+        let ap = col_ptr;
+        let ai = row_idx;
+        let ax = values;
+
+        // ---- symbolic: elimination tree `parent` and per-column counts `lnz` ----
+        let mut parent = vec![usize::MAX; n];
+        let mut flag = vec![usize::MAX; n];
+        let mut lnz = vec![0usize; n];
+        for k in 0..n {
+            flag[k] = k;
+            for p in ap[k]..ap[k + 1] {
+                let mut i = ai[p];
+                if i < k {
+                    while flag[i] != k {
+                        if parent[i] == usize::MAX {
+                            parent[i] = k;
+                        }
+                        lnz[i] += 1;
+                        flag[i] = k;
+                        i = parent[i];
+                    }
+                }
+            }
+        }
+        let mut lp = vec![0usize; n + 1];
+        for k in 0..n {
+            lp[k + 1] = lp[k] + lnz[k];
+        }
+
+        // ---- numeric: compute L (below diagonal) and the signed D ----
+        let mut li = vec![0usize; lp[n]];
+        let mut lx = vec![0.0f64; lp[n]];
+        let mut d = vec![0.0f64; n];
+        let mut y = vec![0.0f64; n]; // dense workspace, zero between columns
+        let mut pattern = vec![0usize; n];
+        let mut fill = vec![0usize; n]; // running count of entries placed per L column
+        for f in flag.iter_mut() {
+            *f = usize::MAX;
+        }
+
+        for k in 0..n {
+            // Gather column k of A (upper triangle, rows i <= k): scatter into Y and collect
+            // the nonzero pattern of row k of L (the etree path) into pattern[top..n].
+            let mut top = n;
+            flag[k] = k;
+            y[k] = 0.0;
+            for p in ap[k]..ap[k + 1] {
+                let i = ai[p];
+                if i <= k {
+                    y[i] += ax[p];
+                    let mut len = 0usize;
+                    let mut ii = i;
+                    while flag[ii] != k {
+                        pattern[len] = ii;
+                        len += 1;
+                        flag[ii] = k;
+                        ii = parent[ii];
+                    }
+                    while len > 0 {
+                        len -= 1;
+                        top -= 1;
+                        pattern[top] = pattern[len];
+                    }
+                }
+            }
+
+            d[k] = y[k];
+            y[k] = 0.0;
+            for idx in top..n {
+                let i = pattern[idx];
+                let yi = y[i];
+                y[i] = 0.0;
+                let start = lp[i];
+                let used = fill[i];
+                for p in start..start + used {
+                    y[li[p]] -= lx[p] * yi;
+                }
+                let l_ki = yi / d[i];
+                d[k] -= l_ki * yi;
+                let slot = start + used;
+                li[slot] = k;
+                lx[slot] = l_ki;
+                fill[i] = used + 1;
+            }
+
+            if d[k] == 0.0 {
+                return Err(LdltError::ZeroPivot(k));
+            }
+        }
+
+        Ok(SparseLdlt { n, lp, li, lx, d })
+    }
+
+    /// The order of the factored matrix.
+    pub fn dim(&self) -> usize {
+        self.n
+    }
+
+    /// The signed diagonal `D`. The count of negative entries is the matrix inertia
+    /// (number of negative eigenvalues), e.g. for a Sturm eigenvalue count.
+    pub fn d(&self) -> &[f64] {
+        &self.d
+    }
+
+    /// Number of stored off-diagonal nonzeros in `L` (the fill-in).
+    pub fn nnz(&self) -> usize {
+        self.lp[self.n]
+    }
+
+    /// Solve `A x = b` for a single right-hand side, returning `x`.
+    ///
+    /// Panics if `b.len() != self.dim()`.
+    pub fn solve(&self, b: &[f64]) -> Vec<f64> {
+        assert_eq!(b.len(), self.n, "rhs length must match matrix order");
+        let mut x = b.to_vec();
+        // L y = b  (forward, unit lower)
+        for j in 0..self.n {
+            let xj = x[j];
+            for p in self.lp[j]..self.lp[j + 1] {
+                x[self.li[p]] -= self.lx[p] * xj;
+            }
+        }
+        // D z = y
+        for j in 0..self.n {
+            x[j] /= self.d[j];
+        }
+        // Lᵀ x = z  (backward)
+        for j in (0..self.n).rev() {
+            let mut acc = x[j];
+            for p in self.lp[j]..self.lp[j + 1] {
+                acc -= self.lx[p] * x[self.li[p]];
+            }
+            x[j] = acc;
+        }
+        x
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deterministic LCG in [-1, 1).
+    struct Rng(u64);
+    impl Rng {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    /// Build a random symmetric matrix in CSC (full storage). `diag_shift` added to
+    /// every diagonal: large positive => SPD, small => indefinite. Returns (col_ptr,
+    /// row_idx, values) and a dense copy for reference.
+    #[allow(clippy::type_complexity)]
+    fn random_symmetric(
+        n: usize,
+        density: f64,
+        diag_shift: f64,
+        seed: u64,
+    ) -> (Vec<usize>, Vec<usize>, Vec<f64>, Vec<Vec<f64>>) {
+        let mut rng = Rng(seed);
+        let mut dense = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if (rng.next_f64() + 1.0) / 2.0 < density {
+                    let v = rng.next_f64();
+                    dense[i][j] = v;
+                    dense[j][i] = v;
+                }
+            }
+            dense[i][i] = rng.next_f64() + diag_shift;
+        }
+        // to CSC (columns)
+        let mut col_ptr = vec![0usize];
+        let mut row_idx = Vec::new();
+        let mut values = Vec::new();
+        for j in 0..n {
+            for i in 0..n {
+                if dense[i][j] != 0.0 {
+                    row_idx.push(i);
+                    values.push(dense[i][j]);
+                }
+            }
+            col_ptr.push(row_idx.len());
+        }
+        (col_ptr, row_idx, values, dense)
+    }
+
+    fn residual_inf(dense: &[Vec<f64>], x: &[f64], b: &[f64]) -> f64 {
+        let n = b.len();
+        (0..n)
+            .map(|i| {
+                let ax: f64 = (0..n).map(|j| dense[i][j] * x[j]).sum();
+                (ax - b[i]).abs()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    // Number of negative eigenvalues of a small dense symmetric matrix via the cyclic
+    // Jacobi eigenvalue algorithm - the reference inertia (Sylvester's law).
+    fn negative_eigs(mat: &[Vec<f64>]) -> usize {
+        let n = mat.len();
+        let mut a = mat.to_vec();
+        for _sweep in 0..100 {
+            let mut off = 0.0;
+            for p in 0..n {
+                for q in (p + 1)..n {
+                    off += a[p][q] * a[p][q];
+                }
+            }
+            if off < 1e-20 {
+                break;
+            }
+            for p in 0..n {
+                for q in (p + 1)..n {
+                    if a[p][q].abs() < 1e-18 {
+                        continue;
+                    }
+                    let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                    let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                    let c = 1.0 / (t * t + 1.0).sqrt();
+                    let s = t * c;
+                    for k in 0..n {
+                        let akp = a[k][p];
+                        let akq = a[k][q];
+                        a[k][p] = c * akp - s * akq;
+                        a[k][q] = s * akp + c * akq;
+                    }
+                    for k in 0..n {
+                        let apk = a[p][k];
+                        let aqk = a[q][k];
+                        a[p][k] = c * apk - s * aqk;
+                        a[q][k] = s * apk + c * aqk;
+                    }
+                }
+            }
+        }
+        (0..n).filter(|&i| a[i][i] < -1e-9).count()
+    }
+
+    #[test]
+    fn spd_solves_accurately_with_no_negative_pivots() {
+        for seed in 0..25u64 {
+            let n = 6 + (seed as usize % 18);
+            let (cp, ri, v, dense) = random_symmetric(n, 0.4, n as f64 + 2.0, seed * 7 + 1);
+            let mut rng = Rng(seed * 13 + 3);
+            let b: Vec<f64> = (0..n).map(|_| rng.next_f64()).collect();
+            let f = SparseLdlt::factor(n, &cp, &ri, &v).expect("SPD factor");
+            let x = f.solve(&b);
+            assert!(residual_inf(&dense, &x, &b) < 1e-9, "seed {seed}: residual too large");
+            assert_eq!(f.d().iter().filter(|&&d| d < 0.0).count(), 0);
+        }
+    }
+
+    #[test]
+    fn indefinite_solves_and_inertia_is_correct() {
+        let mut indefinite = 0;
+        for seed in 0..60u64 {
+            let n = 4 + (seed as usize % 10);
+            let (cp, ri, v, dense) = random_symmetric(n, 0.35, 0.5, seed * 5 + 9);
+            let mut rng = Rng(seed * 17 + 2);
+            let b: Vec<f64> = (0..n).map(|_| rng.next_f64()).collect();
+            let f = match SparseLdlt::factor(n, &cp, &ri, &v) {
+                Ok(f) => f,
+                Err(_) => continue, // zero pivot; un-pivoted LDLT breaks down, skip
+            };
+            let x = f.solve(&b);
+            assert!(residual_inf(&dense, &x, &b) < 1e-7, "seed {seed}: residual too large");
+            let neg = f.d().iter().filter(|&&d| d < 0.0).count();
+            assert_eq!(neg, negative_eigs(&dense), "seed {seed}: inertia mismatch");
+            if neg > 0 {
+                indefinite += 1;
+            }
+        }
+        assert!(indefinite >= 5, "expected several indefinite cases, got {indefinite}");
+    }
+
+    #[test]
+    fn rejects_malformed_input() {
+        assert!(matches!(SparseLdlt::factor(2, &[0, 1], &[0], &[1.0]), Err(LdltError::InvalidInput(_))));
+    }
+}
