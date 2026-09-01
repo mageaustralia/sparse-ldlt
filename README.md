@@ -43,7 +43,7 @@ let values  = vec![2.0, 1.0,  1.0, -3.0, 1.0,  1.0, 2.0];
 let f = SparseLdlt::factor(3, &col_ptr, &row_idx, &values).unwrap();
 
 // Solve A x = b
-let x = f.solve(&[1.0, 2.0, 3.0]);
+let x = f.solve(&[1.0, 2.0, 3.0]).unwrap();
 
 // Inertia: number of negative eigenvalues == number of negative pivots
 let negative_eigenvalues = f.d().iter().filter(|&&v| v < 0.0).count();
@@ -56,9 +56,26 @@ assert_eq!(negative_eigenvalues, 1);
   dissection, ...) before factoring if fill matters for your problem size.
 - **No pivoting.** Like every un-pivoted LDLᵀ it breaks down (returns `LdltError::ZeroPivot`)
   if a diagonal entry of `D` reaches zero - for example when a shift lands exactly on an
-  eigenvalue. Nudge the shift and retry.
-- Correctness is checked against dense residuals and a dense (Jacobi) eigenvalue inertia
-  reference across many random SPD and indefinite matrices; see the tests.
+  eigenvalue. Nudge the shift and retry. Non-finite input values (NaN / ±inf) are rejected.
+- `solve` returns `Result<Vec<f64>, LdltError>` - a right-hand side that does not match the
+  factored order is `LdltError::SizeMismatch`, never a panic.
+- Correctness is gated by an **inertia oracle** (`tests/inertia_oracle.rs`) in the spirit of
+  feral's consensus validation, scoped to what a dependency-free crate can run anywhere:
+  wherever a factorization *succeeds*, the pivot-sign inertia must be exactly correct - no
+  tolerance. The oracle families are matrices whose inertia is known by construction
+  (congruence `A = XᵀSX`, quasi-definite KKT blocks, Sturm shifts with exact endpoints and a
+  monotonicity sweep), plus dense-residual checks at machine precision.
+
+## Provenance
+
+Written from the algorithm's published description - T. A. Davis, *Direct Methods for Sparse
+Linear Systems* (SIAM, 2006) - as an independent implementation. No source code from Tim
+Davis's LDL or from `sprs-ldl` was copied, translated, or consulted while writing it; any
+resemblance is the algorithm itself, which is published mathematics.
+
+Created by [MAGE Engineering](https://mageengineering.com.au/) for its **FEM Analysis Studio**,
+where it replaces an LGPL sparse LDLᵀ dependency in the structural analysis engine. Released
+under the MIT licence so the wider Rust community can use it too.
 
 ## Credits
 

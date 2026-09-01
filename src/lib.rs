@@ -19,6 +19,8 @@
 //! No pivoting is performed: like every un-pivoted LDLᵀ it breaks down (returns
 //! [`LdltError::ZeroPivot`]) if a diagonal entry of `D` reaches zero. For a matrix on a
 //! near-singular point (e.g. a shift landing on an eigenvalue) nudge the shift and retry.
+//! Non-finite input values (NaN / ±inf) are rejected up front rather than silently
+//! propagating through the factors.
 //!
 //! # Example
 //! ```
@@ -31,10 +33,10 @@
 //! let row_idx = vec![0, 1,  0, 1, 2,  1, 2];
 //! let values  = vec![2.0, 1.0,  1.0, -3.0, 1.0,  1.0, 2.0];
 //! let f = SparseLdlt::factor(3, &col_ptr, &row_idx, &values).unwrap();
-//! let x = f.solve(&[1.0, 2.0, 3.0]);
+//! let x = f.solve(&[1.0, 2.0, 3.0]).unwrap();
 //! // one negative pivot => one negative eigenvalue (inertia)
 //! assert_eq!(f.d().iter().filter(|&&v| v < 0.0).count(), 1);
-//! # let _ = x;
+//! # assert!(x.len() == 3);
 //! ```
 
 #![forbid(unsafe_code)]
@@ -42,15 +44,22 @@
 // indices/values arrays); range loops are clearer here than iterator gymnastics.
 #![allow(clippy::needless_range_loop)]
 
-/// Failure modes of the factorization.
+/// Failure modes of the factorization and solves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LdltError {
     /// A zero pivot (`D[k] == 0`) was hit at this column: the matrix is singular or the
     /// un-pivoted factorization broke down there.
     ZeroPivot(usize),
-    /// The CSC arrays were inconsistent (bad length, `col_ptr` not monotonic, or an index
-    /// out of range).
+    /// The CSC arrays were inconsistent (bad length, `col_ptr` not monotonic, an index
+    /// out of range, or a non-finite value).
     InvalidInput(&'static str),
+    /// A right-hand side (or multi-RHS row) did not match the factored matrix's order.
+    SizeMismatch {
+        /// The order of the factored matrix.
+        expected: usize,
+        /// The length that was supplied.
+        got: usize,
+    },
 }
 
 /// An `L D Lᵀ` factorization of a symmetric matrix.
@@ -98,6 +107,16 @@ impl SparseLdlt {
         for &r in row_idx {
             if r >= n {
                 return Err(LdltError::InvalidInput("row index out of range"));
+            }
+        }
+        // A NaN or infinite entry would not hit the `d[k] == 0.0` check (NaN compares
+        // false against zero) and would propagate silently into every factor entry - so
+        // reject it here, where the error can still name the cause.
+        for &v in values {
+            if !v.is_finite() {
+                return Err(LdltError::InvalidInput(
+                    "values contain a non-finite entry (NaN or infinity)",
+                ));
             }
         }
         let ap = col_ptr;
@@ -211,9 +230,13 @@ impl SparseLdlt {
 
     /// Solve `A x = b` for a single right-hand side, returning `x`.
     ///
-    /// Panics if `b.len() != self.dim()`.
-    pub fn solve(&self, b: &[f64]) -> Vec<f64> {
-        assert_eq!(b.len(), self.n, "rhs length must match matrix order");
+    /// # Errors
+    ///
+    /// Returns [`LdltError::SizeMismatch`] if `b.len() != self.dim()`.
+    pub fn solve(&self, b: &[f64]) -> Result<Vec<f64>, LdltError> {
+        if b.len() != self.n {
+            return Err(LdltError::SizeMismatch { expected: self.n, got: b.len() });
+        }
         let mut x = b.to_vec();
         // L y = b  (forward, unit lower)
         for j in 0..self.n {
@@ -234,7 +257,7 @@ impl SparseLdlt {
             }
             x[j] = acc;
         }
-        x
+        Ok(x)
     }
 }
 
@@ -349,7 +372,7 @@ mod tests {
             let mut rng = Rng(seed * 13 + 3);
             let b: Vec<f64> = (0..n).map(|_| rng.next_f64()).collect();
             let f = SparseLdlt::factor(n, &cp, &ri, &v).expect("SPD factor");
-            let x = f.solve(&b);
+            let x = f.solve(&b).unwrap();
             assert!(residual_inf(&dense, &x, &b) < 1e-9, "seed {seed}: residual too large");
             assert_eq!(f.d().iter().filter(|&&d| d < 0.0).count(), 0);
         }
@@ -367,7 +390,7 @@ mod tests {
                 Ok(f) => f,
                 Err(_) => continue, // zero pivot; un-pivoted LDLT breaks down, skip
             };
-            let x = f.solve(&b);
+            let x = f.solve(&b).unwrap();
             assert!(residual_inf(&dense, &x, &b) < 1e-7, "seed {seed}: residual too large");
             let neg = f.d().iter().filter(|&&d| d < 0.0).count();
             assert_eq!(neg, negative_eigs(&dense), "seed {seed}: inertia mismatch");
@@ -381,5 +404,56 @@ mod tests {
     #[test]
     fn rejects_malformed_input() {
         assert!(matches!(SparseLdlt::factor(2, &[0, 1], &[0], &[1.0]), Err(LdltError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn rejects_non_finite_values() {
+        // NaN compares false against every pivot check, so a non-finite entry would silently
+        // poison every factor value - it must be rejected at the door.
+        let cp: &[usize] = &[0, 1, 2];
+        let ri: &[usize] = &[0, 1];
+        assert!(matches!(
+            SparseLdlt::factor(2, cp, ri, &[f64::NAN, 1.0]),
+            Err(LdltError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            SparseLdlt::factor(2, cp, ri, &[1.0, f64::INFINITY]),
+            Err(LdltError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn solve_rejects_wrong_rhs_length() {
+        let f = SparseLdlt::factor(3, &[0, 2, 5, 7], &[0, 1, 0, 1, 2, 1, 2],
+            &[2.0, 1.0, 1.0, -3.0, 1.0, 1.0, 2.0]).unwrap();
+        assert_eq!(
+            f.solve(&[1.0, 2.0]),
+            Err(LdltError::SizeMismatch { expected: 3, got: 2 })
+        );
+    }
+
+    /// KNOWN-ANSWER GOLDEN, hand-computed. For A = [[2,1,0],[1,-3,1],[0,1,2]]:
+    ///   col 0: d0 = 2, l10 = 1/2
+    ///   col 1: y = (1, -3); d1 = -3 - (1/2)(1) = -7/2, l21 = 1/(-7/2) = -2/7
+    ///   col 2: y = (0, 1, 2); the etree path of row 1 is {1} only (A[0][2] = 0, so node 0
+    ///          is a structural zero in L), so d2 = 2 - (-2/7)(1) = 16/7
+    /// Pins the fill pattern (nnz(L) = 2: the (2,0) slot is NOT filled), the signed pivots,
+    /// and the solve: L y = b, D z = y, L^T x = z gives x = (1/2, 0, 3/2).
+    #[test]
+    fn golden_known_answer() {
+        let f = SparseLdlt::factor(3, &[0, 2, 5, 7], &[0, 1, 0, 1, 2, 1, 2],
+            &[2.0, 1.0, 1.0, -3.0, 1.0, 1.0, 2.0]).unwrap();
+        assert_eq!(f.nnz(), 2);
+        assert_eq!(f.dim(), 3);
+        let d = f.d();
+        assert_eq!(d[0], 2.0);
+        assert_eq!(d[1], -3.5);
+        assert!((d[2] - 16.0 / 7.0).abs() < 1e-15, "d2 = {} (want 16/7)", d[2]);
+        // The factors themselves are private; the solve exercises every stored value.
+        let x = f.solve(&[1.0, 2.0, 3.0]).unwrap();
+        let want = [0.5, 0.0, 1.5];
+        for i in 0..3 {
+            assert!((x[i] - want[i]).abs() < 1e-14, "x[{i}] = {} (want {})", x[i], want[i]);
+        }
     }
 }
