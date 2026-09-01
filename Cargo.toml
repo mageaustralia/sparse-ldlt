@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
+authors = ["Matthew Campbell <mcampbell@mageaustralia.com.au>"]
 description = "Pure-Rust, dependency-free sparse symmetric-indefinite LDLᵀ factorization with signed pivots (matrix inertia) and solve."
 readme = "README.md"
 homepage = "https://mageengineering.com.au/"
