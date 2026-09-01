@@ -228,6 +228,19 @@ impl SparseLdlt {
         self.lp[self.n]
     }
 
+    /// Floating-point operation count of the factorization: for each column of `L` with
+    /// `c` stored entries, `c*c + 3*c` (the column-update arithmetic). Deterministic, so
+    /// two factorizations of the same sparsity pattern report identical counts - callers
+    /// (e.g. the supernodal equivalence gates in FEM Studio) assert on exactly that.
+    pub fn flops(&self) -> u64 {
+        let mut f = 0u64;
+        for j in 0..self.n {
+            let c = (self.lp[j + 1] - self.lp[j]) as u64;
+            f += c * c + 3 * c;
+        }
+        f
+    }
+
     /// Solve `A x = b` for a single right-hand side, returning `x`.
     ///
     /// # Errors
