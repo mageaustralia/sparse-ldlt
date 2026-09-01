@@ -65,6 +65,20 @@ assert_eq!(negative_eigenvalues, 1);
   tolerance. The oracle families are matrices whose inertia is known by construction
   (congruence `A = XᵀSX`, quasi-definite KKT blocks, Sturm shifts with exact endpoints and a
   monotonicity sweep), plus dense-residual checks at machine precision.
+- **Property tests** (`tests/property.rs`) pin the adversarial-CSC contract: duplicate
+  entries are summed, explicit zeros are harmless, any row order within a column is
+  accepted, degenerate shapes (n = 0, empty columns) never panic, malformed arrays return
+  `InvalidInput`, and ~2 400 random valid-shape CSCs (wild magnitudes included) produce
+  either a correct factorization or an honest `ZeroPivot` - never a panic or a NaN pivot.
+- **Real-matrix corpus** (`tests/corpus.rs`): real structural stiffness matrices from the
+  SuiteSparse (Harwell-Boeing) collection are bundled as fixtures and gated on external
+  metadata - SPD by the collection, so inertia must be exactly 0 - plus a dense Jacobi
+  cross-check and a `corpus-tests` feature that sweeps any directory of `.mtx` files
+  (`CK_LDLT_CORPUS_DIR`) for CI-scale validation. No network, no dependencies.
+- **Benchmarks** (`cargo bench`, criterion): factor/solve vs n on banded (structural) and
+  random-sparse patterns. The measured fill wall - n = 1024, banded 19 µs vs random-2%
+  ~160 ms - is the quantified case for a fill-reducing ordering (not yet implemented;
+  permute the matrix yourself meanwhile).
 
 ## Provenance
 

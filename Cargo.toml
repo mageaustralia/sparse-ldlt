@@ -10,3 +10,16 @@ keywords = ["sparse", "ldlt", "factorization", "indefinite", "inertia"]
 categories = ["mathematics", "science"]
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+# CI-only: fetch real SuiteSparse/MatrixMarket SPD matrices and validate the factorization
+# against them (see tests/corpus.rs). Requires network at test time; never compiled by
+# default, so `cargo build` and `cargo publish` stay dependency-free.
+corpus-tests = []
+
+[[bench]]
+name = "factor_solve"
+harness = false
