@@ -8,7 +8,7 @@ authors = ["Matthew Campbell <mcampbell@mageaustralia.com.au>"]
 description = "Pure-Rust, dependency-free sparse symmetric-indefinite LDLᵀ factorization with signed pivots (matrix inertia) and solve."
 readme = "README.md"
 homepage = "https://mageengineering.com.au/"
-# repository = ... set when the repo has a public home (crates.io links it from the crate page)
+repository = "https://github.com/mageaustralia/sparse-ldlt"
 keywords = ["sparse", "ldlt", "factorization", "indefinite", "inertia"]
 categories = ["mathematics", "science"]
 
