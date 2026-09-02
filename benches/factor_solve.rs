@@ -76,7 +76,7 @@ fn bench_factor(c: &mut Criterion) {
     // measured answer to that wall.
     for n in [64usize, 256, 1024, 4096] {
         let (cp, ri, v) = banded(n);
-        group.bench_function(&format!("banded/{n}"), |b| {
+        group.bench_function(format!("banded/{n}"), |b| {
             b.iter(|| {
                 SparseLdlt::factor(black_box(n), black_box(&cp), black_box(&ri), black_box(&v))
                     .unwrap()
@@ -84,14 +84,14 @@ fn bench_factor(c: &mut Criterion) {
         });
         if n <= 1024 {
             let (cp, ri, v) = random_spd(n, 0.02, 42 + n as u64);
-            group.bench_function(&format!("random2pct/{n}"), |b| {
+            group.bench_function(format!("random2pct/{n}"), |b| {
                 b.iter(|| {
                     SparseLdlt::factor(black_box(n), black_box(&cp), black_box(&ri), black_box(&v))
                         .unwrap()
                 })
             });
             let order = sparse_ldlt::amd(n, &cp, &ri);
-            group.bench_function(&format!("random2pct-amd/{n}"), |b| {
+            group.bench_function(format!("random2pct-amd/{n}"), |b| {
                 b.iter(|| {
                     SparseLdlt::factor_perm(
                         black_box(n),
@@ -107,7 +107,7 @@ fn bench_factor(c: &mut Criterion) {
             // Banded + AMD at 4096: the ordering must not hurt the structural shape.
             let (cp, ri, v) = banded(n);
             let order = sparse_ldlt::amd(n, &cp, &ri);
-            group.bench_function(&format!("banded-amd/{n}"), |b| {
+            group.bench_function(format!("banded-amd/{n}"), |b| {
                 b.iter(|| {
                     SparseLdlt::factor_perm(
                         black_box(n),
