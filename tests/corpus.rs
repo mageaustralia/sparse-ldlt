@@ -13,7 +13,7 @@
 //!
 //! THE FEATURE-GATED SWEEP (`--features corpus-tests`, plus `CK_LDLT_CORPUS_DIR` pointing
 //! at a directory of .mtx files): factors every file found, asserting the universal
-//! contract - Ok-with-finite-pivots or an honest ZeroPivot, never a panic, and symmetric-
+//! contract - Ok-with-finite-pivots or an honest pivot breakdown, never a panic, and symmetric-
 //! completion residual accuracy on every success. No HTTP dependency: CI fetches the
 //! matrices (e.g. curl the SuiteSparse MM tarballs) and points the env var at them; the
 //! crate itself stays dependency-free even with the feature on.
@@ -207,7 +207,7 @@ fn corpus_dir_sweep() {
                 assert!(res < 1e-3, "{}: residual {res}", path.display());
                 swept += 1;
             }
-            Err(LdltError::ZeroPivot(_)) => swept += 0, // honest breakdown, counted, not a failure
+            Err(LdltError::ZeroPivot(_) | LdltError::NearZeroPivot { .. }) => swept += 0, // honest breakdown, counted, not a failure
             Err(e) => panic!("{}: unexpected {e:?}", path.display()),
         }
     }

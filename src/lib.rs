@@ -16,9 +16,14 @@
 //! compressed-sparse-column (CSC) form; only the upper triangle (entries with row ≤ col
 //! in each column) is read, so a fully-populated symmetric matrix is also accepted.
 //!
-//! No pivoting is performed: like every un-pivoted LDLᵀ it breaks down (returns
-//! [`LdltError::ZeroPivot`]) if a diagonal entry of `D` reaches zero. For a matrix on a
-//! near-singular point (e.g. a shift landing on an eigenvalue) nudge the shift and retry.
+//! No pivoting is performed: like every un-pivoted LDLᵀ it breaks down if a diagonal entry
+//! of `D` reaches zero ([`LdltError::ZeroPivot`]) - and, just as importantly, if a pivot's
+//! magnitude has been destroyed by cancellation ([`LdltError::NearZeroPivot`]). The second
+//! case is the dangerous one: such a pivot still carries a sign, but that sign is rounding
+//! noise, and the sign pattern of `D` IS the matrix inertia, so a silently-returned
+//! near-zero pivot is a silently wrong eigenvalue count. Both are reported, never
+//! swallowed. [`SparseLdlt::factor_shifted`] retries the breakdown with a diagonal shift
+//! and tells you, via [`SparseLdlt::shift`], exactly how far it moved the matrix.
 //! Non-finite input values (NaN / ±inf) are rejected up front rather than silently
 //! propagating through the factors.
 //!
@@ -44,12 +49,54 @@
 // indices/values arrays); range loops are clearer here than iterator gymnastics.
 #![allow(clippy::needless_range_loop)]
 
+/// Relative tolerance below which a pivot counts as destroyed rather than merely small.
+///
+/// `1e-13` is about 1000x `f64::EPSILON`. Below it a pivot has lost essentially all of its
+/// significant digits to cancellation, so its magnitude is meaningless and - the reason this
+/// matters here - its SIGN is rounding noise. Since the sign pattern of `D` is the matrix
+/// inertia, accepting such a pivot means returning an inertia that is noise, silently.
+///
+/// The threshold is deliberately not configurable: a caller who wants a different one should
+/// scale their matrix so that the tolerance means what they want it to mean, or use
+/// [`SparseLdlt::factor_shifted`], which moves the matrix off the near-singular point instead
+/// of arguing about where the cliff edge is.
+pub const NEAR_ZERO_PIVOT_REL: f64 = 1e-13;
+
 /// Failure modes of the factorization and solves.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is deliberately not derived: [`LdltError::NearZeroPivot`] carries `f64` payloads.
+#[derive(Debug, Clone, PartialEq)]
 pub enum LdltError {
     /// A zero pivot (`D[k] == 0`) was hit at this column: the matrix is singular or the
     /// un-pivoted factorization broke down there.
     ZeroPivot(usize),
+    /// A pivot that is not exactly zero but has lost every significant digit to
+    /// cancellation: `|D[k]| < ` [`NEAR_ZERO_PIVOT_REL`] `* scale`.
+    ///
+    /// This is the honest report of the case that used to be returned silently, and it
+    /// matters because the sign pattern of `D` is the matrix inertia (Sylvester's law).
+    /// A pivot at this magnitude still has a sign, but that sign is rounding noise, so the
+    /// inertia read from the factorization would be noise too - and downstream that inertia
+    /// is a Sturm eigenvalue count, i.e. an eigenvalue or buckling load. Returning it is
+    /// strictly better than returning a number nobody can tell is wrong.
+    ///
+    /// Recover by moving off the near-singular point: either shift the matrix yourself, or
+    /// call [`SparseLdlt::factor_shifted`], which does exactly that and reports the shift it
+    /// used through [`SparseLdlt::shift`].
+    NearZeroPivot {
+        /// The column at which the pivot collapsed.
+        column: usize,
+        /// The computed pivot value. Its sign is not trustworthy at this magnitude.
+        pivot: f64,
+        /// The largest absolute diagonal entry of the input matrix - the reference the
+        /// tolerance is relative to.
+        scale: f64,
+        /// A diagonal shift large enough to clear the breakdown: `sqrt(`
+        /// [`NEAR_ZERO_PIVOT_REL`] `) * scale`, i.e. comfortably outside the tolerance band
+        /// rather than on its edge. Factoring `A + suggested_shift * I` is an exact
+        /// factorization of a NEARBY matrix, not of `A`.
+        suggested_shift: f64,
+    },
     /// The CSC arrays were inconsistent (bad length, `col_ptr` not monotonic, an index
     /// out of range, or a non-finite value).
     InvalidInput(&'static str),
@@ -78,6 +125,53 @@ pub struct SparseLdlt {
     // [`SparseLdlt::factor_perm`], which `solve` uses to map right-hand sides in and
     // solutions back out.
     order: Vec<usize>,
+    // The diagonal shift that was actually applied, if any. See [`SparseLdlt::shift`].
+    shift: f64,
+}
+
+/// The largest absolute diagonal entry of a CSC matrix, summing duplicate entries the same
+/// way the factorization's scatter does. `0.0` if the matrix stores no diagonal at all -
+/// callers must guard against that, or a relative tolerance test would pass vacuously.
+fn diagonal_scale(n: usize, col_ptr: &[usize], row_idx: &[usize], values: &[f64]) -> f64 {
+    let mut scale = 0.0f64;
+    for k in 0..n {
+        let mut dk = 0.0f64;
+        for p in col_ptr[k]..col_ptr[k + 1] {
+            if row_idx[p] == k {
+                dk += values[p];
+            }
+        }
+        scale = scale.max(dk.abs());
+    }
+    scale
+}
+
+/// `(col_ptr, row_idx, values)` for `A + shift * I`. One extra diagonal entry is appended per
+/// column; the factorization sums duplicates in its scatter, so this is correct whether or not
+/// the column already stored a diagonal, and it is correct under a symmetric permutation too
+/// (a diagonal entry stays diagonal).
+#[allow(clippy::type_complexity)]
+fn with_diagonal_shift(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    values: &[f64],
+    shift: f64,
+) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    let mut cp = Vec::with_capacity(n + 1);
+    let mut ri = Vec::with_capacity(row_idx.len() + n);
+    let mut vx = Vec::with_capacity(values.len() + n);
+    cp.push(0usize);
+    for k in 0..n {
+        for p in col_ptr[k]..col_ptr[k + 1] {
+            ri.push(row_idx[p]);
+            vx.push(values[p]);
+        }
+        ri.push(k);
+        vx.push(shift);
+        cp.push(ri.len());
+    }
+    (cp, ri, vx)
 }
 
 impl SparseLdlt {
@@ -127,6 +221,10 @@ impl SparseLdlt {
         let ap = col_ptr;
         let ai = row_idx;
         let ax = values;
+        // The reference magnitude for the near-zero pivot test, computed once. Guarded
+        // against 0.0 below: a matrix with no diagonal at all would otherwise make the
+        // relative test pass vacuously for every pivot.
+        let scale = diagonal_scale(n, ap, ai, ax);
 
         // ---- symbolic: elimination tree `parent` and per-column counts `lnz` ----
         let mut parent = vec![usize::MAX; n];
@@ -212,9 +310,24 @@ impl SparseLdlt {
             if d[k] == 0.0 {
                 return Err(LdltError::ZeroPivot(k));
             }
+            // A pivot that is merely SMALL used to be returned silently. It cannot be: at this
+            // magnitude the pivot's sign is rounding noise, and the sign pattern of D is the
+            // matrix inertia, so a silent return here is a silently wrong eigenvalue count.
+            if scale > 0.0 && d[k].abs() < NEAR_ZERO_PIVOT_REL * scale {
+                return Err(LdltError::NearZeroPivot {
+                    column: k,
+                    pivot: d[k],
+                    scale,
+                    // sqrt(tol) * scale, not tol * scale: a shift right at the tolerance would
+                    // land back on the edge of the band it is supposed to escape. The square
+                    // root puts it several orders of magnitude clear while still being a tiny
+                    // perturbation of the matrix.
+                    suggested_shift: NEAR_ZERO_PIVOT_REL.sqrt() * scale,
+                });
+            }
         }
 
-        Ok(SparseLdlt { n, lp, li, lx, d, order: (0..n).collect() })
+        Ok(SparseLdlt { n, lp, li, lx, d, order: (0..n).collect(), shift: 0.0 })
     }
 
     /// Factor `P A Pᵀ` for a symmetric permutation `P` given as `order`, where
@@ -284,6 +397,98 @@ impl SparseLdlt {
         let mut f = Self::factor(n, &pcp, &pri, &pv)?;
         f.order = order.to_vec();
         Ok(f)
+    }
+
+    /// Like [`SparseLdlt::factor`], but on a breakdown it retries with a positive diagonal
+    /// shift instead of giving up.
+    ///
+    /// The unshifted factorization is tried first, so a well-conditioned matrix costs nothing
+    /// extra and comes back with [`SparseLdlt::shift`] `== 0.0`. On [`LdltError::ZeroPivot`]
+    /// or [`LdltError::NearZeroPivot`] the matrix is refactored as `A + shift * I`, starting
+    /// from the suggested shift and multiplying by 8 each attempt, at most 8 attempts; if none
+    /// succeeds the last error is returned.
+    ///
+    /// THE RESULT IS AN EXACT FACTORIZATION OF A NEARBY MATRIX, NOT OF `A`. Its pivots are the
+    /// pivots of `A + shift * I`, so its inertia is that matrix's inertia and a Sturm count
+    /// taken from it is a count at a sigma moved by `shift`. A solve against it is a solve of
+    /// the shifted system. Ignoring [`SparseLdlt::shift`] is a bug in the caller.
+    pub fn factor_shifted(
+        n: usize,
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        values: &[f64],
+    ) -> Result<Self, LdltError> {
+        Self::shifted_retry(n, col_ptr, row_idx, values, None)
+    }
+
+    /// [`SparseLdlt::factor_perm`] with the shifted-retry behaviour of
+    /// [`SparseLdlt::factor_shifted`]. The same warning applies: a non-zero
+    /// [`SparseLdlt::shift`] means this factored `A + shift * I`, not `A`.
+    pub fn factor_perm_shifted(
+        n: usize,
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        values: &[f64],
+        order: &[usize],
+    ) -> Result<Self, LdltError> {
+        Self::shifted_retry(n, col_ptr, row_idx, values, Some(order))
+    }
+
+    /// Shared body of the two shifted entry points. `order` selects the permuted path.
+    fn shifted_retry(
+        n: usize,
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        values: &[f64],
+        order: Option<&[usize]>,
+    ) -> Result<Self, LdltError> {
+        let attempt = |cp: &[usize], ri: &[usize], vx: &[f64]| match order {
+            Some(o) => Self::factor_perm(n, cp, ri, vx, o),
+            None => Self::factor(n, cp, ri, vx),
+        };
+        let mut last = match attempt(col_ptr, row_idx, values) {
+            Ok(f) => return Ok(f),
+            Err(e) => e,
+        };
+        // Only a pivot breakdown is worth retrying: malformed input or a size mismatch will
+        // fail identically no matter how the diagonal is nudged.
+        let mut shift = match last {
+            LdltError::NearZeroPivot {
+                suggested_shift, ..
+            } => suggested_shift,
+            LdltError::ZeroPivot(_) => {
+                // ZeroPivot carries no suggestion, so derive the same starting point it would
+                // have carried.
+                NEAR_ZERO_PIVOT_REL.sqrt() * diagonal_scale(n, col_ptr, row_idx, values)
+            }
+            other => return Err(other),
+        };
+        if shift <= 0.0 {
+            // A matrix with no diagonal at all gives no scale to shift by; there is nothing
+            // honest to do but report the original breakdown.
+            return Err(last);
+        }
+        for _ in 0..8 {
+            let (cp, ri, vx) = with_diagonal_shift(n, col_ptr, row_idx, values, shift);
+            match attempt(&cp, &ri, &vx) {
+                Ok(mut f) => {
+                    f.shift = shift;
+                    return Ok(f);
+                }
+                Err(e) => last = e,
+            }
+            shift *= 8.0;
+        }
+        Err(last)
+    }
+
+    /// The diagonal shift actually applied. 0.0 for [`SparseLdlt::factor`] /
+    /// [`SparseLdlt::factor_perm`], which never shift. Non-zero means this is an exact
+    /// factorization of `A + shift * I`, NOT of `A`: its inertia is the inertia of the shifted
+    /// matrix, so a Sturm count taken from it is a count for the caller's sigma moved by this
+    /// much, and the caller must correct for it.
+    pub fn shift(&self) -> f64 {
+        self.shift
     }
 
     /// The order of the factored matrix.
@@ -653,6 +858,70 @@ mod tests {
             f.solve(&[1.0, 2.0]),
             Err(LdltError::SizeMismatch { expected: 3, got: 2 })
         );
+    }
+
+    /// A tiny leading pivot is a DESTROYED pivot, not a small one: it used to be returned
+    /// silently, carrying a sign that is rounding noise into the caller's inertia.
+    #[test]
+    fn near_zero_pivot_is_reported_not_returned() {
+        // [[1e-18, 1], [1, 1]]: scale 1, so the first pivot is 1e-18 relative - far below the
+        // threshold. The old code factored this and handed back a sign nobody could check.
+        let cp: &[usize] = &[0, 2, 4];
+        let ri: &[usize] = &[0, 1, 0, 1];
+        let v: &[f64] = &[1e-18, 1.0, 1.0, 1.0];
+        match SparseLdlt::factor(2, cp, ri, v) {
+            Err(LdltError::NearZeroPivot {
+                column,
+                pivot,
+                scale,
+                suggested_shift,
+            }) => {
+                assert_eq!(column, 0);
+                assert_eq!(pivot, 1e-18);
+                assert_eq!(scale, 1.0);
+                assert!(suggested_shift > NEAR_ZERO_PIVOT_REL * scale);
+            }
+            other => panic!("expected NearZeroPivot, got {other:?}"),
+        }
+        // An EXACT zero is still the plain ZeroPivot it always was.
+        assert!(matches!(
+            SparseLdlt::factor(1, &[0, 1], &[0], &[0.0]),
+            Err(LdltError::ZeroPivot(0))
+        ));
+        // factor_perm delegates to the same numeric loop, so it reports it too. (A different
+        // elimination order can legitimately dodge this particular breakdown, so the identity
+        // order is what proves the shared path is covered.)
+        match SparseLdlt::factor_perm(2, cp, ri, v, &[0, 1]) {
+            Err(LdltError::NearZeroPivot { column, .. }) => assert_eq!(column, 0),
+            other => panic!("expected NearZeroPivot from factor_perm, got {other:?}"),
+        }
+    }
+
+    /// The shifted entry points recover, and they say by how much - a caller reading the
+    /// inertia without reading `shift()` would be reading it for the wrong matrix.
+    #[test]
+    fn factor_shifted_recovers_and_reports_the_shift() {
+        let cp: &[usize] = &[0, 2, 4];
+        let ri: &[usize] = &[0, 1, 0, 1];
+        let v: &[f64] = &[1e-18, 1.0, 1.0, 1.0];
+        let f = SparseLdlt::factor_shifted(2, cp, ri, v).expect("shifted factor");
+        let sh = f.shift();
+        assert!(sh > 0.0, "shift was {sh}");
+        // It factored A + sh*I, so THAT is the system it solves.
+        let b = [1.0, 2.0];
+        let x = f.solve(&b).unwrap();
+        let a = [[1e-18 + sh, 1.0], [1.0, 1.0 + sh]];
+        for i in 0..2 {
+            let ax = a[i][0] * x[0] + a[i][1] * x[1];
+            assert!((ax - b[i]).abs() < 1e-9, "row {i}: {ax} vs {}", b[i]);
+        }
+        let g = SparseLdlt::factor_perm_shifted(2, cp, ri, v, &[0, 1]).expect("shifted perm");
+        assert!(g.shift() > 0.0);
+        // A healthy matrix is never shifted: the unshifted attempt comes first.
+        let h = SparseLdlt::factor_shifted(2, cp, ri, &[3.0, 1.0, 1.0, 2.0]).unwrap();
+        assert_eq!(h.shift(), 0.0);
+        let plain = SparseLdlt::factor(2, cp, ri, &[3.0, 1.0, 1.0, 2.0]).unwrap();
+        assert_eq!(plain.shift(), 0.0);
     }
 
     /// KNOWN-ANSWER GOLDEN, hand-computed. For A = [[2,1,0],[1,-3,1],[0,1,2]]:

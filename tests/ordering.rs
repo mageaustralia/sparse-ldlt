@@ -163,7 +163,7 @@ fn inertia_is_invariant_under_ordering() {
         let (cp, ri, v, dense) = random_symmetric(n, 0.35, 0.5, seed * 5 + 2);
         let plain = match SparseLdlt::factor(n, &cp, &ri, &v) {
             Ok(f) => f,
-            Err(LdltError::ZeroPivot(_)) => continue, // honest breakdown on this shift
+            Err(LdltError::ZeroPivot(_) | LdltError::NearZeroPivot { .. }) => continue, // honest breakdown on this shift
             Err(e) => panic!("seed {seed}: {e:?}"),
         };
         let amd_order = amd(n, &cp, &ri);

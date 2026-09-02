@@ -15,7 +15,7 @@
 //! - unordered rows within a column        -> accepted (documented: "any row order")
 //! - n = 0, empty arrays, single entry     -> degenerate but valid
 //! - out-of-range / non-monotonic col_ptr  -> InvalidInput, never a panic
-//! - random garbage CSC (valid shape)      -> Ok or ZeroPivot, never a panic
+//! - random garbage CSC (valid shape)      -> Ok or a pivot breakdown, never a panic
 //! - invariance: row order within columns must not change the answer (beyond fp reordering)
 
 #![allow(clippy::needless_range_loop)]
@@ -72,7 +72,7 @@ fn solves_original_system(
     let b: Vec<f64> = (0..n).map(|_| rng.next_f64()).collect();
     let f = match SparseLdlt::factor(n, cp, ri, v) {
         Ok(f) => f,
-        Err(LdltError::ZeroPivot(_)) => return Ok(()), // honest breakdown, not a failure
+        Err(LdltError::ZeroPivot(_) | LdltError::NearZeroPivot { .. }) => return Ok(()), // honest breakdown
         Err(e) => return Err(format!("unexpected error {e:?}")),
     };
     let x = match f.solve(&b) {
@@ -137,7 +137,7 @@ fn lower_triangle_only_is_accepted() {
     // pattern) still yields the correct solve on the symmetric completion. Wait: row <= col
     // read means a lower-triangle-only input has its UPPER half missing; the factorization
     // sees a matrix whose strict upper part is structurally zero. Assert the honest
-    // consequence: it factors (or ZeroPivots) and never panics - and for a DIAGONAL
+    // consequence: it factors (or reports a pivot breakdown) and never panics - and for a DIAGONAL
     // lower-only matrix it is exact.
     let cp: &[usize] = &[0, 1, 2, 3];
     let ri: &[usize] = &[0, 1, 2];
@@ -244,7 +244,8 @@ fn random_valid_shape_garbage_never_panics() {
     // THE FUZZ: random CSC arrays with a VALID SHAPE (indices in range, col_ptr monotone)
     // but arbitrary values and patterns - duplicate rows inside a column included. The only
     // legal outcomes are Ok (then the residual check applies on the upper triangle the
-    // algorithm actually read) or ZeroPivot. Panics and NaN outputs are failures.
+    // algorithm actually read) or a pivot breakdown - ZeroPivot for an exact zero,
+    // NearZeroPivot for one destroyed by cancellation. Panics and NaN outputs are failures.
     for seed in 0..300u64 {
         let n = 1 + (seed as usize % 24);
         let mut rng = Rng(seed * 7919 + 13);
@@ -282,7 +283,7 @@ fn random_valid_shape_garbage_never_panics() {
                 let x = f.solve(&b).unwrap();
                 assert!(x.iter().all(|xi| xi.is_finite()), "seed {seed}: non-finite solve");
             }
-            Err(LdltError::ZeroPivot(_)) => {}   // the one honest failure
+            Err(LdltError::ZeroPivot(_) | LdltError::NearZeroPivot { .. }) => {} // the honest failures
             Err(e) => panic!("seed {seed}: unexpected {e:?}"),
         }
     }

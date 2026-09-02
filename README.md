@@ -27,14 +27,34 @@ consumers.)
 
 ## No pivoting - read this before relying on the inertia count
 
-**The factorization is un-pivoted.** If a pivot `D[k]` reaches exactly zero, `factor`
-fails loudly with `LdltError::ZeroPivot(k)` - but a pivot that is merely *small* factors
-through with whatever sign the rounding produces. On a matrix near a singular point - a
-shift `σ` landing on an eigenvalue, a mechanism in a structure - that can make an inertia
-count WRONG without any error being raised. If your use case needs certified pivots under
-those conditions, you need a pivoting solver (Bunch-Kaufman / multifrontal); this crate
-trades that machinery for ~700 dependency-free lines. The Sturm-count mitigation is to
-treat a near-zero pivot as a sign the shift is too close and re-factor at a nudged shift.
+**The factorization is un-pivoted.** A pivot `D[k]` that reaches exactly zero fails loudly
+with `LdltError::ZeroPivot(k)`. A pivot whose magnitude has been destroyed by cancellation
+is just as dangerous and is now reported too, as
+`LdltError::NearZeroPivot { column, pivot, scale, suggested_shift }`, whenever
+`|D[k]| < NEAR_ZERO_PIVOT_REL * scale` (`1e-13` relative to the largest absolute diagonal
+entry of the input, about 1000x `f64::EPSILON`). That case is the one worth naming: such a
+pivot still carries a *sign*, but the sign is rounding noise, and the sign pattern of `D`
+IS the matrix inertia - so on a matrix near a singular point (a shift `σ` landing on an
+eigenvalue, a mechanism in a structure) the old behaviour was a WRONG inertia count with no
+error raised. It is no longer returned silently.
+
+Recovering from it is no longer the caller's problem either. `factor_shifted` (and
+`factor_perm_shifted`) try the unshifted factorization first, and on a breakdown retry with
+a positive diagonal shift - starting at `suggested_shift`, multiplying by 8, at most 8
+attempts. `shift()` reports how far the matrix was moved:
+
+```rust
+let f = SparseLdlt::factor_shifted(n, &col_ptr, &row_idx, &values)?;
+if f.shift() != 0.0 {
+    // This is an exact factorization of A + shift*I, NOT of A. Its inertia is the shifted
+    // matrix's inertia, so a Sturm count from it is a count at (sigma - shift): correct for
+    // it. Ignoring shift() is a bug.
+}
+```
+
+If your use case needs certified pivots without any perturbation, you need a pivoting solver
+(Bunch-Kaufman / multifrontal); this crate trades that machinery for ~800 dependency-free
+lines, and reports honestly where the trade bites.
 
 ## Fill-reducing ordering (AMD)
 
@@ -87,8 +107,9 @@ assert_eq!(negative_eigenvalues, 1);
 
 - **Ordering:** `amd` + `factor_perm` are built in (see above). The plain `factor` still
   applies none - deterministic and unchanged since v0.1.0.
-- **No pivoting** (see the section above): breakdown is loud (`LdltError::ZeroPivot`), but
-  small pivots factor through with rounding's sign - near a singular point, nudge the shift.
+- **No pivoting** (see the section above): breakdown is loud - `LdltError::ZeroPivot` for an
+  exact zero, `LdltError::NearZeroPivot` for a pivot whose sign has become rounding noise.
+  `factor_shifted` does the nudging and `shift()` says how much it nudged.
   Non-finite input values (NaN / ±inf) are rejected.
 - `solve` returns `Result<Vec<f64>, LdltError>` - a right-hand side that does not match the
   factored order is `LdltError::SizeMismatch`, never a panic.
@@ -97,12 +118,19 @@ assert_eq!(negative_eigenvalues, 1);
   wherever a factorization *succeeds*, the pivot-sign inertia must be exactly correct - no
   tolerance. The oracle families are matrices whose inertia is known by construction
   (congruence `A = XᵀSX`, quasi-definite KKT blocks, Sturm shifts with exact endpoints and a
-  monotonicity sweep), plus dense-residual checks at machine precision.
+  monotonicity sweep), plus dense-residual checks at machine precision. A fourth,
+  *adversarial* family targets the near-zero pivot directly - shifts landing 1e-15 from an
+  eigenvalue, quasi-definite blocks with a diagonal entry driven to 1e-18, and KKT saddle
+  points with a zero (2,2) block and a rank-deficient constraint - and is oracled against a
+  dependency-free dense cyclic Jacobi eigensolver that is itself checked against closed-form
+  spectra. Each fixture must either be refused or produce the exact inertia, and every
+  refusal must then be recovered by `factor_shifted` with a small residual against
+  `A + shift*I`.
 - **Property tests** (`tests/property.rs`) pin the adversarial-CSC contract: duplicate
   entries are summed, explicit zeros are harmless, any row order within a column is
   accepted, degenerate shapes (n = 0, empty columns) never panic, malformed arrays return
   `InvalidInput`, and ~330 random valid-shape CSCs (wild magnitudes included) produce
-  either a correct factorization or an honest `ZeroPivot` - never a panic or a NaN pivot.
+  either a correct factorization or an honest pivot breakdown - never a panic or a NaN pivot.
 - **Real-matrix corpus** (`tests/corpus.rs`): real structural stiffness matrices from the
   SuiteSparse (Harwell-Boeing) collection are bundled as fixtures and gated on external
   metadata - SPD by the collection, so inertia must be exactly 0 - plus a dense Jacobi
