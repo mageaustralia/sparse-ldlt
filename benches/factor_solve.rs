@@ -72,23 +72,53 @@ fn bench_factor(c: &mut Criterion) {
     // n = 4096 runs on the BANDED family only: the random family at that size has no
     // fill-reducing ordering available (see README), the factor is effectively cubic, and
     // the wall it hits IS the ordering motivation - measured at 1024, extrapolated beyond.
+    // The `amd` rows are the same shapes with the AMD ordering from this crate - the
+    // measured answer to that wall.
     for n in [64usize, 256, 1024, 4096] {
         let (cp, ri, v) = banded(n);
-        group.bench_with_input(BenchmarkId::new("banded", n), &(cp, ri, v), |b, (cp, ri, v)| {
-            b.iter(|| SparseLdlt::factor(black_box(n), black_box(cp), black_box(ri), black_box(v)).unwrap())
+        group.bench_function(&format!("banded/{n}"), |b| {
+            b.iter(|| {
+                SparseLdlt::factor(black_box(n), black_box(&cp), black_box(&ri), black_box(&v))
+                    .unwrap()
+            })
         });
         if n <= 1024 {
             let (cp, ri, v) = random_spd(n, 0.02, 42 + n as u64);
-            group.bench_with_input(
-                BenchmarkId::new("random2pct", n),
-                &(cp, ri, v),
-                |b, (cp, ri, v)| {
-                    b.iter(|| {
-                        SparseLdlt::factor(black_box(n), black_box(cp), black_box(ri), black_box(v))
-                            .unwrap()
-                    })
-                },
-            );
+            group.bench_function(&format!("random2pct/{n}"), |b| {
+                b.iter(|| {
+                    SparseLdlt::factor(black_box(n), black_box(&cp), black_box(&ri), black_box(&v))
+                        .unwrap()
+                })
+            });
+            let order = sparse_ldlt::amd(n, &cp, &ri);
+            group.bench_function(&format!("random2pct-amd/{n}"), |b| {
+                b.iter(|| {
+                    SparseLdlt::factor_perm(
+                        black_box(n),
+                        black_box(&cp),
+                        black_box(&ri),
+                        black_box(&v),
+                        black_box(&order),
+                    )
+                    .unwrap()
+                })
+            });
+        } else {
+            // Banded + AMD at 4096: the ordering must not hurt the structural shape.
+            let (cp, ri, v) = banded(n);
+            let order = sparse_ldlt::amd(n, &cp, &ri);
+            group.bench_function(&format!("banded-amd/{n}"), |b| {
+                b.iter(|| {
+                    SparseLdlt::factor_perm(
+                        black_box(n),
+                        black_box(&cp),
+                        black_box(&ri),
+                        black_box(&v),
+                        black_box(&order),
+                    )
+                    .unwrap()
+                })
+            });
         }
     }
     group.finish();

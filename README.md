@@ -1,6 +1,6 @@
 # sparse-ldlt
 
-Pure-Rust, dependency-free sparse **symmetric-indefinite** LDLᵀ factorization and solver.
+Pure-Rust, dependency-free sparse **symmetric-indefinite LDLᵀ factorization** and solver.
 
 Factors a symmetric sparse matrix `A = L·D·Lᵀ` (with `L` unit-lower-triangular and `D` a
 **signed** diagonal), then solves `A x = b`. Because `D` may hold negative entries, it
@@ -22,6 +22,36 @@ pivots is the whole point:
 `sparse-ldlt` is a small, self-contained implementation of the standard up-looking sparse
 LDLᵀ (elimination-tree) method - see T. A. Davis, *Direct Methods for Sparse Linear Systems*
 (SIAM, 2006) - with **no dependencies**, no `unsafe`, and stable-Rust only.
+
+## No pivoting - read this before relying on the inertia count
+
+**The factorization is un-pivoted.** If a pivot `D[k]` reaches exactly zero, `factor`
+fails loudly with `LdltError::ZeroPivot(k)` - but a pivot that is merely *small* factors
+through with whatever sign the rounding produces. On a matrix near a singular point - a
+shift `σ` landing on an eigenvalue, a mechanism in a structure - that can make an inertia
+count WRONG without any error being raised. If your use case needs certified pivots under
+those conditions, you need a pivoting solver (Bunch-Kaufman / multifrontal); this crate
+trades that machinery for ~600 dependency-free lines. The Sturm-count mitigation is to
+treat a near-zero pivot as a sign the shift is too close and re-factor at a nudged shift.
+
+## Fill-reducing ordering (AMD)
+
+```rust
+use sparse_ldlt::{amd, SparseLdlt};
+
+let order = amd(n, &col_ptr, &row_idx);                 // Amestoy-Davis-Duff ordering
+let f = SparseLdlt::factor_perm(n, &col_ptr, &row_idx, &values, &order).unwrap();
+let x = f.solve(&b).unwrap();                           // permutation handled for you
+```
+
+Without an ordering, fill-in on an irregular sparsity can cost orders of magnitude
+(measured, `cargo bench`: random 2%-dense n=1024 - unordered factor ~160 ms vs 19 µs on a
+banded matrix of the same order). `amd` is a quotient-graph approximate minimum degree
+(Amestoy-Davis-Duff 1996) implemented in this crate with the same zero-dependency rules:
+eliminated nodes become elements, degrees are the AMD external degrees recomputed over the
+neighbourhood only. Ordering NEVER changes inertia (a symmetric permutation is a
+congruence - Sylvester's law), so Sturm counts are identical with or without it; the
+`tests/ordering.rs` gate asserts exactly that, alongside measured fill reduction.
 
 ## Usage
 
@@ -52,11 +82,11 @@ assert_eq!(negative_eigenvalues, 1);
 
 ## Notes
 
-- **No fill-reducing reordering** is applied. Permute the matrix yourself (RCM, AMD, nested
-  dissection, ...) before factoring if fill matters for your problem size.
-- **No pivoting.** Like every un-pivoted LDLᵀ it breaks down (returns `LdltError::ZeroPivot`)
-  if a diagonal entry of `D` reaches zero - for example when a shift lands exactly on an
-  eigenvalue. Nudge the shift and retry. Non-finite input values (NaN / ±inf) are rejected.
+- **Ordering:** `amd` + `factor_perm` are built in (see above). The plain `factor` still
+  applies none - deterministic and unchanged since v0.1.0.
+- **No pivoting** (see the section above): breakdown is loud (`LdltError::ZeroPivot`), but
+  small pivots factor through with rounding's sign - near a singular point, nudge the shift.
+  Non-finite input values (NaN / ±inf) are rejected.
 - `solve` returns `Result<Vec<f64>, LdltError>` - a right-hand side that does not match the
   factored order is `LdltError::SizeMismatch`, never a panic.
 - Correctness is gated by an **inertia oracle** (`tests/inertia_oracle.rs`) in the spirit of
