@@ -283,3 +283,50 @@ fn factor_perm_rejects_non_permutations() {
         Err(LdltError::InvalidInput(_))
     ));
 }
+
+/// THE ORDERING MUST COST LESS THAN THE FACTORIZATION IT SERVES. On the shipped product's 5.9k-node
+/// shell mesh (2026-09-03) the first AMD took 1.7 s against a 0.2 s factorization, because it never
+/// absorbed elements: every variable kept every element it had ever touched and every degree update
+/// rescanned them all. A 100 x 100 triangulated grid (10k nodes, ~6 neighbours each, the shell mesh's
+/// shape) has to order in well under a second - and its fill must still beat natural order by the
+/// margin a 2D mesh gives AMD.
+#[test]
+fn amd_orders_a_mesh_sized_graph_in_bounded_time() {
+    let s = 100usize;
+    let n = s * s;
+    let id = |r: usize, c: usize| r * s + c;
+    let mut cols: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for r in 0..s {
+        for c in 0..s {
+            let i = id(r, c);
+            let mut nb = vec![];
+            if c + 1 < s { nb.push(id(r, c + 1)); }
+            if r + 1 < s { nb.push(id(r + 1, c)); }
+            if r + 1 < s && c + 1 < s { nb.push(id(r + 1, c + 1)); }   // the diagonal that makes it a triangulation
+            for j in nb { cols[i].push(j); cols[j].push(i); }
+        }
+    }
+    let mut cp = vec![0usize];
+    let mut ri = Vec::new();
+    let mut v = Vec::new();
+    for (i, col) in cols.iter_mut().enumerate() {
+        col.push(i);
+        col.sort_unstable();
+        col.dedup();
+        for &r in col.iter() { ri.push(r); v.push(if r == i { 8.0 } else { -1.0 }); }
+        cp.push(ri.len());
+    }
+    let t0 = std::time::Instant::now();
+    let order = amd(n, &cp, &ri);
+    let dt = t0.elapsed().as_secs_f64();
+    assert_eq!(order.len(), n);
+    let mut seen = vec![false; n];
+    for &k in &order { assert!(!seen[k]); seen[k] = true; }
+    println!("amd on a {s}x{s} triangulated grid: {dt:.3} s");
+    assert!(dt < 1.0, "AMD took {dt:.2} s on a 10k-node mesh graph - the ordering must not cost more than the factorization");
+    let plain = SparseLdlt::factor(n, &cp, &ri, &v).unwrap();
+    let ordered = SparseLdlt::factor_perm(n, &cp, &ri, &v, &order).unwrap();
+    let ratio = plain.nnz() as f64 / ordered.nnz() as f64;
+    println!("  fill ratio {ratio:.2}x");
+    assert!(ratio >= 3.0, "fill ratio {ratio:.2}x: AMD should beat natural order by 3x on a 100x100 mesh");
+}
