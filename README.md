@@ -21,7 +21,9 @@ pivots is the whole point:
 
 `sparse-ldlt` is a small, self-contained implementation of the standard up-looking sparse
 LDLᵀ (elimination-tree) method - see T. A. Davis, *Direct Methods for Sparse Linear Systems*
-(SIAM, 2006) - with **no dependencies**, no `unsafe`, and stable-Rust only.
+(SIAM, 2006) - with **zero runtime dependencies**, no `unsafe`, and stable-Rust only.
+(Its own tests and benchmarks use dev-only crates - criterion - which never ship to
+consumers.)
 
 ## No pivoting - read this before relying on the inertia count
 
@@ -31,7 +33,7 @@ through with whatever sign the rounding produces. On a matrix near a singular po
 shift `σ` landing on an eigenvalue, a mechanism in a structure - that can make an inertia
 count WRONG without any error being raised. If your use case needs certified pivots under
 those conditions, you need a pivoting solver (Bunch-Kaufman / multifrontal); this crate
-trades that machinery for ~600 dependency-free lines. The Sturm-count mitigation is to
+trades that machinery for ~700 dependency-free lines. The Sturm-count mitigation is to
 treat a near-zero pivot as a sign the shift is too close and re-factor at a nudged shift.
 
 ## Fill-reducing ordering (AMD)
@@ -45,8 +47,9 @@ let x = f.solve(&b).unwrap();                           // permutation handled f
 ```
 
 Without an ordering, fill-in on an irregular sparsity can cost orders of magnitude
-(measured, `cargo bench`: random 2%-dense n=1024 - unordered factor ~160 ms vs 19 µs on a
-banded matrix of the same order). `amd` is a quotient-graph approximate minimum degree
+(measured, `cargo bench`: random 2%-dense n=1024 - unordered factor ~0.27 s vs ~30 µs on a
+banded matrix of the same order; with `amd` + `factor_perm` the same random matrix factors
+in ~70 ms). `amd` is a quotient-graph approximate minimum degree
 (Amestoy-Davis-Duff 1996) implemented in this crate with the same zero-dependency rules:
 eliminated nodes become elements, degrees are the AMD external degrees recomputed over the
 neighbourhood only. Ordering NEVER changes inertia (a symmetric permutation is a
@@ -98,7 +101,7 @@ assert_eq!(negative_eigenvalues, 1);
 - **Property tests** (`tests/property.rs`) pin the adversarial-CSC contract: duplicate
   entries are summed, explicit zeros are harmless, any row order within a column is
   accepted, degenerate shapes (n = 0, empty columns) never panic, malformed arrays return
-  `InvalidInput`, and ~2 400 random valid-shape CSCs (wild magnitudes included) produce
+  `InvalidInput`, and ~330 random valid-shape CSCs (wild magnitudes included) produce
   either a correct factorization or an honest `ZeroPivot` - never a panic or a NaN pivot.
 - **Real-matrix corpus** (`tests/corpus.rs`): real structural stiffness matrices from the
   SuiteSparse (Harwell-Boeing) collection are bundled as fixtures and gated on external
@@ -106,9 +109,11 @@ assert_eq!(negative_eigenvalues, 1);
   cross-check and a `corpus-tests` feature that sweeps any directory of `.mtx` files
   (`CK_LDLT_CORPUS_DIR`) for CI-scale validation. No network, no dependencies.
 - **Benchmarks** (`cargo bench`, criterion): factor/solve vs n on banded (structural) and
-  random-sparse patterns. The measured fill wall - n = 1024, banded 19 µs vs random-2%
-  ~160 ms - is the quantified case for a fill-reducing ordering (not yet implemented;
-  permute the matrix yourself meanwhile).
+  random-sparse patterns, with and without AMD. The measured fill wall - n = 1024, banded
+  ~30 µs vs random-2% ~0.27 s - is what `amd` addresses: the same random matrix factors in
+  ~70 ms ordered (~0.27 s unordered). On a banded matrix AMD neither helps nor much hurts
+  (n = 4096: ~121 µs unordered, ~187 µs ordered). Numbers from one machine; run
+  `cargo bench` for yours.
 
 ## Provenance
 
@@ -116,12 +121,6 @@ Written from the algorithm's published description - T. A. Davis, *Direct Method
 Linear Systems* (SIAM, 2006) - as an independent implementation. No source code from Tim
 Davis's LDL or from `sprs-ldl` was copied, translated, or consulted while writing it; any
 resemblance is the algorithm itself, which is published mathematics.
-
-Created by [MAGE Engineering](https://mageengineering.com.au/) for its **FEM Analysis Studio**,
-where it replaces an LGPL sparse LDLᵀ dependency in the structural analysis engine. Released
-under the MIT licence so the wider Rust community can use it too.
-
-## Credits
 
 Created by [MAGE Engineering](https://mageengineering.com.au/) for its **FEM Analysis Studio**,
 where it replaces an LGPL sparse LDLᵀ dependency in the structural analysis engine. Released
