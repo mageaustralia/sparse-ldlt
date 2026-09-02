@@ -189,6 +189,38 @@ impl SparseLdlt {
         row_idx: &[usize],
         values: &[f64],
     ) -> Result<Self, LdltError> {
+        Self::factor_inner(n, col_ptr, row_idx, values, None)
+    }
+
+    /// Like [`SparseLdlt::factor`], but a near-zero pivot is RECORDED and the factorization
+    /// continues, instead of aborting at the first one.
+    ///
+    /// This exists for RANK CHECKS, not for solves. A caller asking "which directions of this
+    /// matrix are null" needs the elimination to run to the end and name every column that
+    /// collapsed - a structure with fifteen mechanisms has fifteen of them, and stopping at the
+    /// first would report one. The returned factor is NOT fit to solve or to sign-count with:
+    /// every collapsed column's pivot is rounding noise, exactly the value [`SparseLdlt::factor`]
+    /// refuses to return. Use the column list; discard `d()` for anything but structure.
+    ///
+    /// An exact zero pivot still aborts, as it must: the elimination cannot proceed through it.
+    pub fn factor_reporting_collapse(
+        n: usize,
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        values: &[f64],
+    ) -> Result<(Self, Vec<usize>), LdltError> {
+        let mut collapsed = Vec::new();
+        let f = Self::factor_inner(n, col_ptr, row_idx, values, Some(&mut collapsed))?;
+        Ok((f, collapsed))
+    }
+
+    fn factor_inner(
+        n: usize,
+        col_ptr: &[usize],
+        row_idx: &[usize],
+        values: &[f64],
+        mut collapsed: Option<&mut Vec<usize>>,
+    ) -> Result<Self, LdltError> {
         if col_ptr.len() != n + 1 {
             return Err(LdltError::InvalidInput("col_ptr length must be n + 1"));
         }
@@ -314,6 +346,10 @@ impl SparseLdlt {
             // magnitude the pivot's sign is rounding noise, and the sign pattern of D is the
             // matrix inertia, so a silent return here is a silently wrong eigenvalue count.
             if scale > 0.0 && d[k].abs() < NEAR_ZERO_PIVOT_REL * scale {
+                if let Some(list) = collapsed.as_deref_mut() {
+                    list.push(k);
+                    continue;
+                }
                 return Err(LdltError::NearZeroPivot {
                     column: k,
                     pivot: d[k],

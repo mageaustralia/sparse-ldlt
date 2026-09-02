@@ -534,3 +534,23 @@ fn near_zero_pivot_adversarial() {
         failures.join("\n  ")
     );
 }
+
+/// `factor` refuses at the FIRST collapsed pivot; `factor_reporting_collapse` runs to the end and
+/// names EVERY one. A rank check on a structure with several mechanisms needs the second - the
+/// fem workspace's slab-on-pads fixture has fifteen, and reporting one of them sent a previous
+/// investigation after the factorization instead of the model.
+#[test]
+fn reporting_collapse_names_every_collapsed_column_where_factor_names_the_first() {
+    // diag(1, 1e-20, 1, 1e-20): two pivots far below NEAR_ZERO_PIVOT_REL * scale, at columns 1 and 3.
+    let n = 4;
+    let col_ptr = [0usize, 1, 2, 3, 4];
+    let row_idx = [0usize, 1, 2, 3];
+    let values = [1.0, 1e-20, 1.0, 1e-20];
+    match sparse_ldlt::SparseLdlt::factor(n, &col_ptr, &row_idx, &values) {
+        Err(sparse_ldlt::LdltError::NearZeroPivot { column, .. }) => assert_eq!(column, 1, "strict stops at the first"),
+        other => panic!("strict factor must refuse a collapsed pivot, got {other:?}"),
+    }
+    let (_, collapsed) = sparse_ldlt::SparseLdlt::factor_reporting_collapse(n, &col_ptr, &row_idx, &values)
+        .expect("the reporting form runs to the end");
+    assert_eq!(collapsed, vec![1, 3], "every collapsed column, in elimination order");
+}
