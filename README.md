@@ -1,159 +1,132 @@
 # sparse-ldlt
 
-Pure-Rust, dependency-free sparse **symmetric-indefinite LDLᵀ factorization** and solver.
+A sparse LDLᵀ factorization for symmetric matrices, including indefinite ones, in pure Rust
+with no dependencies.
 
-Factors a symmetric sparse matrix `A = L·D·Lᵀ` (with `L` unit-lower-triangular and `D` a
-**signed** diagonal), then solves `A x = b`. Because `D` may hold negative entries, it
-handles symmetric **indefinite** systems - not just positive-definite ones - and it exposes
-`D`, so you can read the matrix **inertia** (the number of negative eigenvalues, by
-Sylvester's law of inertia) directly from the pivots.
+It factors `A = L D Lᵀ`, where `L` is unit lower triangular and `D` is diagonal, and solves
+`A x = b`. `D` can hold negative entries, and it is exposed. By Sylvester's law of inertia, the
+number of negative entries in `D` is the number of negative eigenvalues of `A`.
 
-## Why this exists
+## When to use it
 
-Most sparse direct solvers available in pure Rust only provide **positive-definite Cholesky**
-and never expose the signed pivots. That leaves a gap for the problems where the sign of the
-pivots is the whole point:
+Most pure-Rust sparse solvers offer only Cholesky, which needs a positive-definite matrix and
+does not report pivot signs. This crate is for problems where the matrix is indefinite or the
+signs matter:
 
-- **saddle-point / KKT systems** from constrained optimisation and mixed finite elements,
-- **shifted eigenvalue matrices** `K - σM`, which are indefinite for shifts inside the
-  spectrum - factoring them and counting negative pivots gives a **Sturm eigenvalue count**,
-- **quasi-definite** systems (interior-point methods).
+- saddle-point (KKT) systems from constrained optimisation and mixed finite elements;
+- shifted eigenvalue problems `K - σM`, where counting negative pivots gives the number of
+  eigenvalues below `σ` (a Sturm count);
+- quasi-definite systems from interior-point methods.
 
-`sparse-ldlt` is a small, self-contained implementation of the standard up-looking sparse
-LDLᵀ (elimination-tree) method - see T. A. Davis, *Direct Methods for Sparse Linear Systems*
-(SIAM, 2006) - with **zero runtime dependencies**, no `unsafe`, and stable-Rust only.
-(Its own tests and benchmarks use dev-only crates - criterion - which never ship to
-consumers.)
-
-## No pivoting - read this before relying on the inertia count
-
-**The factorization is un-pivoted.** A pivot `D[k]` that reaches exactly zero fails loudly
-with `LdltError::ZeroPivot(k)`. A pivot whose magnitude has been destroyed by cancellation
-is just as dangerous and is now reported too, as
-`LdltError::NearZeroPivot { column, pivot, scale, suggested_shift }`, whenever
-`|D[k]| < NEAR_ZERO_PIVOT_REL * scale` (`1e-13` relative to the largest absolute diagonal
-entry of the input, about 1000x `f64::EPSILON`). That case is the one worth naming: such a
-pivot still carries a *sign*, but the sign is rounding noise, and the sign pattern of `D`
-IS the matrix inertia - so on a matrix near a singular point (a shift `σ` landing on an
-eigenvalue, a mechanism in a structure) the old behaviour was a WRONG inertia count with no
-error raised. It is no longer returned silently.
-
-Recovering from it is no longer the caller's problem either. `factor_shifted` (and
-`factor_perm_shifted`) try the unshifted factorization first, and on a breakdown retry with
-a positive diagonal shift - starting at `suggested_shift`, multiplying by 8, at most 8
-attempts. `shift()` reports how far the matrix was moved:
-
-```rust
-let f = SparseLdlt::factor_shifted(n, &col_ptr, &row_idx, &values)?;
-if f.shift() != 0.0 {
-    // This is an exact factorization of A + shift*I, NOT of A. Its inertia is the shifted
-    // matrix's inertia, so a Sturm count from it is a count at (sigma - shift): correct for
-    // it. Ignoring shift() is a bug.
-}
-```
-
-If your use case needs certified pivots without any perturbation, you need a pivoting solver
-(Bunch-Kaufman / multifrontal); this crate trades that machinery for ~800 dependency-free
-lines, and reports honestly where the trade bites.
-
-## Fill-reducing ordering (AMD)
-
-```rust
-use sparse_ldlt::{amd, SparseLdlt};
-
-let order = amd(n, &col_ptr, &row_idx);                 // Amestoy-Davis-Duff ordering
-let f = SparseLdlt::factor_perm(n, &col_ptr, &row_idx, &values, &order).unwrap();
-let x = f.solve(&b).unwrap();                           // permutation handled for you
-```
-
-Without an ordering, fill-in on an irregular sparsity can cost orders of magnitude
-(measured, `cargo bench`: random 2%-dense n=1024 - unordered factor ~0.27 s vs ~30 µs on a
-banded matrix of the same order; with `amd` + `factor_perm` the same random matrix factors
-in ~70 ms). `amd` is a quotient-graph approximate minimum degree
-(Amestoy-Davis-Duff 1996) implemented in this crate with the same zero-dependency rules:
-eliminated nodes become elements, degrees are the AMD external degrees recomputed over the
-neighbourhood only. Ordering NEVER changes inertia (a symmetric permutation is a
-congruence - Sylvester's law), so Sturm counts are identical with or without it; the
-`tests/ordering.rs` gate asserts exactly that, alongside measured fill reduction.
+It implements the up-looking elimination-tree method described in T. A. Davis, *Direct Methods
+for Sparse Linear Systems* (SIAM, 2006). It has no runtime dependencies, uses no `unsafe` code
+and builds on stable Rust.
 
 ## Usage
 
-Supply the matrix in compressed-sparse-column (CSC) form. Only the upper triangle
-(entries with row ≤ col in each column) is read, so a fully-populated symmetric matrix is
-also fine.
+Pass the matrix in compressed sparse column (CSC) form. Only the upper triangle (row ≤ column)
+is read, so you can pass either the upper triangle or the full matrix.
 
 ```rust
 use sparse_ldlt::SparseLdlt;
 
-// Symmetric indefinite 3x3 matrix (full storage), in CSC:
 //   [ 2  1  0 ]
 //   [ 1 -3  1 ]
 //   [ 0  1  2 ]
 let col_ptr = vec![0, 2, 5, 7];
-let row_idx = vec![0, 1,  0, 1, 2,  1, 2];
-let values  = vec![2.0, 1.0,  1.0, -3.0, 1.0,  1.0, 2.0];
+let row_idx = vec![0, 1, 0, 1, 2, 1, 2];
+let values = vec![2.0, 1.0, 1.0, -3.0, 1.0, 1.0, 2.0];
 
 let f = SparseLdlt::factor(3, &col_ptr, &row_idx, &values).unwrap();
-
-// Solve A x = b
 let x = f.solve(&[1.0, 2.0, 3.0]).unwrap();
 
-// Inertia: number of negative eigenvalues == number of negative pivots
-let negative_eigenvalues = f.d().iter().filter(|&&v| v < 0.0).count();
-assert_eq!(negative_eigenvalues, 1);
+// One negative pivot, so one negative eigenvalue.
+let negative = f.d().iter().filter(|&&v| v < 0.0).count();
+assert_eq!(negative, 1);
 ```
 
-## Notes
+## Ordering
 
-- **Ordering:** `amd` + `factor_perm` are built in (see above). The plain `factor` still
-  applies none - deterministic and unchanged since v0.1.0.
-- **No pivoting** (see the section above): breakdown is loud - `LdltError::ZeroPivot` for an
-  exact zero, `LdltError::NearZeroPivot` for a pivot whose sign has become rounding noise.
-  `factor_shifted` does the nudging and `shift()` says how much it nudged.
-  Non-finite input values (NaN / ±inf) are rejected.
-- `solve` returns `Result<Vec<f64>, LdltError>` - a right-hand side that does not match the
-  factored order is `LdltError::SizeMismatch`, never a panic.
-- Correctness is gated by an **inertia oracle** (`tests/inertia_oracle.rs`) in the spirit of
-  feral's consensus validation, scoped to what a dependency-free crate can run anywhere:
-  wherever a factorization *succeeds*, the pivot-sign inertia must be exactly correct - no
-  tolerance. The oracle families are matrices whose inertia is known by construction
-  (congruence `A = XᵀSX`, quasi-definite KKT blocks, Sturm shifts with exact endpoints and a
-  monotonicity sweep), plus dense-residual checks at machine precision. A fourth,
-  *adversarial* family targets the near-zero pivot directly - shifts landing 1e-15 from an
-  eigenvalue, quasi-definite blocks with a diagonal entry driven to 1e-18, and KKT saddle
-  points with a zero (2,2) block and a rank-deficient constraint - and is oracled against a
-  dependency-free dense cyclic Jacobi eigensolver that is itself checked against closed-form
-  spectra. Each fixture must either be refused or produce the exact inertia, and every
-  refusal must then be recovered by `factor_shifted` with a small residual against
-  `A + shift*I`.
-- **Property tests** (`tests/property.rs`) pin the adversarial-CSC contract: duplicate
-  entries are summed, explicit zeros are harmless, any row order within a column is
-  accepted, degenerate shapes (n = 0, empty columns) never panic, malformed arrays return
-  `InvalidInput`, and ~330 random valid-shape CSCs (wild magnitudes included) produce
-  either a correct factorization or an honest pivot breakdown - never a panic or a NaN pivot.
-- **Real-matrix corpus** (`tests/corpus.rs`): real structural stiffness matrices from the
-  SuiteSparse (Harwell-Boeing) collection are bundled as fixtures and gated on external
-  metadata - SPD by the collection, so inertia must be exactly 0 - plus a dense Jacobi
-  cross-check and a `corpus-tests` feature that sweeps any directory of `.mtx` files
-  (`CK_LDLT_CORPUS_DIR`) for CI-scale validation. No network, no dependencies.
-- **Benchmarks** (`cargo bench`, criterion): factor/solve vs n on banded (structural) and
-  random-sparse patterns, with and without AMD. The measured fill wall - n = 1024, banded
-  ~30 µs vs random-2% ~0.27 s - is what `amd` addresses: the same random matrix factors in
-  ~70 ms ordered (~0.27 s unordered). On a banded matrix AMD neither helps nor much hurts
-  (n = 4096: ~121 µs unordered, ~187 µs ordered). Numbers from one machine; run
-  `cargo bench` for yours.
+For anything other than a banded matrix, reorder it first. `amd` computes an approximate
+minimum degree ordering (Amestoy, Davis and Duff, 1996) and `factor_perm` applies it. `solve`
+handles the permutation for you.
+
+```rust
+use sparse_ldlt::{amd, SparseLdlt};
+
+let order = amd(n, &col_ptr, &row_idx);
+let f = SparseLdlt::factor_perm(n, &col_ptr, &row_idx, &values, &order).unwrap();
+let x = f.solve(&b).unwrap();
+```
+
+On one machine, a random 2%-dense matrix with n = 1024 took about 0.27 s to factor without
+ordering and about 70 ms with it. On banded matrices, ordering makes little difference. Run
+`cargo bench` to measure on yours.
+
+A symmetric permutation does not change the inertia, so the negative-pivot count is the same
+with or without ordering.
+
+## Pivot breakdown
+
+The factorization does no pivoting. When a pivot is zero or close to it, `factor` returns an
+error instead of a result:
+
+- `LdltError::ZeroPivot(k)` when pivot `k` is exactly zero.
+- `LdltError::NearZeroPivot { column, pivot, scale, suggested_shift }` when
+  `|D[k]| < NEAR_ZERO_PIVOT_REL * scale`, where `scale` is the largest absolute diagonal entry of
+  `A` and `NEAR_ZERO_PIVOT_REL` is `1e-13`. The sign of such a pivot is rounding error, so an
+  inertia count taken from it could be wrong.
+
+`factor_shifted` and `factor_perm_shifted` recover from these errors. They try the unshifted
+factorization first. If it breaks down, they factor `A + shift·I`, starting from
+`suggested_shift` and multiplying the shift by 8 on each retry, for up to 8 attempts.
+
+```rust
+let f = SparseLdlt::factor_shifted(n, &col_ptr, &row_idx, &values)?;
+if f.shift() != 0.0 {
+    // f factors A + shift·I, not A. Its inertia, and any solve, are for the shifted matrix.
+}
+```
+
+Always check `shift()` after a shifted factorization. If you need exact pivots with no
+perturbation, use a solver with Bunch-Kaufman or multifrontal pivoting instead.
+
+## Errors
+
+Every failure is an `LdltError`, never a panic:
+
+- `ZeroPivot` and `NearZeroPivot`, described above.
+- `InvalidInput` for malformed CSC arrays or non-finite values (NaN, ±inf).
+- `SizeMismatch` when a right-hand side does not match the matrix order.
+
+## Testing
+
+- **Inertia** (`tests/inertia_oracle.rs`): matrices whose inertia is known by construction
+  (congruences `XᵀSX`, quasi-definite KKT blocks, Sturm shifts at known eigenvalues). Whenever a
+  factorization succeeds, its inertia must be exactly right. A second set places pivots near
+  zero on purpose. Each of those must either be refused or give the right inertia, and every
+  refusal must then be recovered by `factor_shifted`.
+- **Input handling** (`tests/property.rs`): duplicate entries are summed, explicit zeros and
+  any row order within a column are accepted, and empty or malformed input never panics. About
+  330 random matrices each give either a correct factorization or a pivot error.
+- **Real matrices** (`tests/corpus.rs`): structural stiffness matrices from the SuiteSparse
+  collection, which are positive definite, so every pivot must be positive. With the
+  `corpus-tests` feature, the test also factors every `.mtx` file in the directory named by
+  `CK_LDLT_CORPUS_DIR`.
+- **Ordering** (`tests/ordering.rs`): AMD reduces fill and never changes the inertia.
+- **Benchmarks** (`cargo bench`, using criterion): factor and solve times against n, for
+  banded and random patterns, with and without AMD.
+
+criterion is a dev-dependency only. It is not part of what you download.
 
 ## Provenance
 
-Written from the algorithm's published description - T. A. Davis, *Direct Methods for Sparse
-Linear Systems* (SIAM, 2006) - as an independent implementation. No source code from Tim
-Davis's LDL or from `sprs-ldl` was copied, translated, or consulted while writing it; any
-resemblance is the algorithm itself, which is published mathematics.
+This is an independent implementation, written from the published description of the method
+in Davis (2006). It does not copy or translate code from Tim Davis's LDL or from `sprs-ldl`.
 
-Created by [MAGE Engineering](https://mageengineering.com.au/) for its **FEM Analysis Studio**,
-where it replaces an LGPL sparse LDLᵀ dependency in the structural analysis engine. Released
-under the MIT licence so the wider Rust community can use it too.
+It was written by [MAGE Engineering](https://mageengineering.com.au/) for its FEM Analysis
+Studio, where it replaced an LGPL-licensed dependency.
 
 ## Licence
 
-MIT - see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
