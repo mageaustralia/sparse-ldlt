@@ -384,5 +384,10 @@ fn factor_perm_on_upper_triangle_only_input_solves_the_same_system() {
     for ord in [&order, &reversed] {
         let x = SparseLdlt::factor_perm(n, &col_ptr, &row_idx, &values, ord).unwrap().solve(&b).unwrap();
         assert!(residual(&x) < 1e-10, "permuted solve residual {:e}", residual(&x));
+        // `factor_perm_shifted` reaches the same permutation code: a positive-definite matrix factors unshifted (shift 0), so it must solve identically.
+        let f = SparseLdlt::factor_perm_shifted(n, &col_ptr, &row_idx, &values, ord).unwrap();
+        assert_eq!(f.shift(), 0.0, "an SPD matrix should not need a shift");
+        let xs = f.solve(&b).unwrap();
+        assert!(residual(&xs) < 1e-10, "factor_perm_shifted residual {:e}", residual(&xs));
     }
 }
