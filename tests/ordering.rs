@@ -330,3 +330,59 @@ fn amd_orders_a_mesh_sized_graph_in_bounded_time() {
     println!("  fill ratio {ratio:.2}x");
     assert!(ratio >= 3.0, "fill ratio {ratio:.2}x: AMD should beat natural order by 3x on a 100x100 mesh");
 }
+
+/// `factor_perm` reads the UPPER triangle like `factor`, so an ordering that sends an entry below the diagonal must reflect it, not drop it.
+/// Before 0.3.4 an upper-triangle-only input gave a different matrix once permuted (residual ~1 on this 7 x 6 grid); a full input survived only
+/// because it also carried the mirror image.
+#[test]
+fn factor_perm_on_upper_triangle_only_input_solves_the_same_system() {
+    let (nx, ny) = (7usize, 6usize);
+    let n = nx * ny;
+    let id = |i: usize, j: usize| j * nx + i;
+    let mut up: Vec<(usize, usize, f64)> = vec![];
+    let mut deg = vec![1.0; n];
+    for j in 0..ny {
+        for i in 0..nx {
+            for (di, dj) in [(1usize, 0usize), (0, 1)] {
+                let (i2, j2) = (i + di, j + dj);
+                if i2 < nx && j2 < ny {
+                    let (a, b) = (id(i, j), id(i2, j2));
+                    up.push((a.min(b), a.max(b), -1.0));
+                    deg[a] += 1.0;
+                    deg[b] += 1.0;
+                }
+            }
+        }
+    }
+    for k in 0..n {
+        up.push((k, k, deg[k]));
+    }
+    up.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+    let mut col_ptr = vec![0usize; n + 1];
+    let (mut row_idx, mut values) = (vec![], vec![]);
+    for &(r, c, v) in &up {
+        row_idx.push(r);
+        values.push(v);
+        col_ptr[c + 1] += 1;
+    }
+    for c in 0..n {
+        col_ptr[c + 1] += col_ptr[c];
+    }
+    let b: Vec<f64> = (0..n).map(|k| (k % 5) as f64 - 2.0).collect();
+    let residual = |x: &[f64]| {
+        let mut kx = vec![0.0; n];
+        for &(r, c, v) in &up {
+            kx[r] += v * x[c];
+            if r != c {
+                kx[c] += v * x[r];
+            }
+        }
+        kx.iter().zip(&b).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max)
+    };
+    let order = amd(n, &col_ptr, &row_idx);
+    let reversed: Vec<usize> = (0..n).rev().collect();
+    for ord in [&order, &reversed] {
+        let x = SparseLdlt::factor_perm(n, &col_ptr, &row_idx, &values, ord).unwrap().solve(&b).unwrap();
+        assert!(residual(&x) < 1e-10, "permuted solve residual {:e}", residual(&x));
+    }
+}

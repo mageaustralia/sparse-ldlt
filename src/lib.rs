@@ -401,31 +401,36 @@ impl SparseLdlt {
             }
             pos[old] = new;
         }
-        // Permute the CSC: new column k holds old column order[k], rows remapped by pos,
-        // sorted within each column, duplicates summed (the same semantics `factor` gives
-        // duplicate entries via its scatter).
+        // Permute the matrix. Only the UPPER triangle of the input is read (row <= col), exactly as `factor` does, so a permuted entry that lands
+        // below the diagonal is reflected to its mirror position above it. Dropping it instead - what this did before 0.3.4 - made the permuted
+        // matrix a different one whenever the input held the upper triangle only (a full-matrix input happened to survive, because its mirror
+        // image was also present). Duplicates are summed, the same semantics `factor` gives duplicate entries through its scatter.
+        let mut cols: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for old_c in 0..n {
+            for p in col_ptr[old_c]..col_ptr[old_c + 1] {
+                let old_r = row_idx[p];
+                if old_r > old_c {
+                    continue;
+                }
+                let (pr, pc) = (pos[old_r], pos[old_c]);
+                let (r, c) = if pr <= pc { (pr, pc) } else { (pc, pr) };
+                cols[c].push((r, values[p]));
+            }
+        }
         let mut entries: Vec<(usize, f64)> = Vec::with_capacity(values.len());
         let mut pcp = vec![0usize; n + 1];
         for k in 0..n {
-            let old_k = order[k];
-            for p in col_ptr[old_k]..col_ptr[old_k + 1] {
-                entries.push((pos[row_idx[p]], values[p]));
-            }
-            entries[pcp[k]..].sort_unstable_by_key(|e| e.0);
-            // Sum duplicate rows within the column (they are now adjacent).
-            let mut w = pcp[k];
-            let mut r = pcp[k];
-            while r < entries.len() {
-                let (row, mut val) = entries[r];
+            cols[k].sort_unstable_by_key(|e| e.0);
+            let mut r = 0;
+            while r < cols[k].len() {
+                let (row, mut val) = cols[k][r];
                 r += 1;
-                while r < entries.len() && entries[r].0 == row {
-                    val += entries[r].1;
+                while r < cols[k].len() && cols[k][r].0 == row {
+                    val += cols[k][r].1;
                     r += 1;
                 }
-                entries[w] = (row, val);
-                w += 1;
+                entries.push((row, val));
             }
-            entries.truncate(w);
             pcp[k + 1] = entries.len();
         }
         let pri: Vec<usize> = entries.iter().map(|e| e.0).collect();
