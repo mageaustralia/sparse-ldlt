@@ -554,3 +554,28 @@ fn reporting_collapse_names_every_collapsed_column_where_factor_names_the_first(
         .expect("the reporting form runs to the end");
     assert_eq!(collapsed, vec![1, 3], "every collapsed column, in elimination order");
 }
+
+/// An EXACT zero pivot is a collapse like any other in the reporting form, and the elimination goes
+/// on past it without dividing by it. Whether a null direction cancels to 0.0 or to one ulp is
+/// decided by summation order, so a report that aborted on 0.0 depended on rounding: the fem
+/// workspace's slab-on-pads fixture named its fifteen mechanisms under one ordering and fell back to
+/// a guess under another.
+#[test]
+fn reporting_collapse_records_an_exact_zero_and_eliminates_past_it() {
+    // [[1,1,1],[1,1,1],[1,1,2]], rank 2: d0 = 1, d1 = 1 - 1 = 0.0 exactly, and column 2 couples to
+    // column 1, so dividing by its pivot would be 0/0. With column 1 dropped, d2 = 2 - 1 = 1.
+    let n = 3;
+    let col_ptr = [0usize, 1, 3, 6];
+    let row_idx = [0usize, 0, 1, 0, 1, 2];
+    let values = [1.0, 1.0, 1.0, 1.0, 1.0, 2.0];
+    match sparse_ldlt::SparseLdlt::factor(n, &col_ptr, &row_idx, &values) {
+        Err(sparse_ldlt::LdltError::ZeroPivot(1)) => {}
+        other => panic!("strict factor must refuse the exact zero at column 1, got {other:?}"),
+    }
+    let (f, collapsed) = sparse_ldlt::SparseLdlt::factor_reporting_collapse(n, &col_ptr, &row_idx, &values)
+        .expect("the reporting form runs to the end through an exact zero");
+    assert_eq!(collapsed, vec![1], "the null column, and only it");
+    let d = f.d();
+    assert!(d.iter().all(|v| v.is_finite()), "no pivot divided by zero: {d:?}");
+    assert!((d[0] - 1.0).abs() < 1e-12 && (d[2] - 1.0).abs() < 1e-12, "the live pivots are exact: {d:?}");
+}

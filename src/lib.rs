@@ -202,7 +202,10 @@ impl SparseLdlt {
     /// every collapsed column's pivot is rounding noise, exactly the value [`SparseLdlt::factor`]
     /// refuses to return. Use the column list; discard `d()` for anything but structure.
     ///
-    /// An exact zero pivot still aborts, as it must: the elimination cannot proceed through it.
+    /// An EXACT zero pivot is recorded too: on a singular matrix, whether cancellation leaves 0.0
+    /// or one ulp is decided by summation order alone. Every recorded column is dropped from the
+    /// rest of the elimination (a null direction has nothing to contribute), so no later column
+    /// divides by its pivot.
     pub fn factor_reporting_collapse(
         n: usize,
         col_ptr: &[usize],
@@ -290,6 +293,11 @@ impl SparseLdlt {
         let mut y = vec![0.0f64; n]; // dense workspace, zero between columns
         let mut pattern = vec![0usize; n];
         let mut fill = vec![0usize; n]; // running count of entries placed per L column
+        // Reporting mode only: columns already recorded as collapsed. Each is a null direction, so
+        // it is dropped from the rest of the elimination (its L entries stay zero) rather than
+        // divided by: dividing by a zero pivot is a NaN, and dividing by rounding noise spreads
+        // that noise into every later column.
+        let mut dead = vec![false; if collapsed.is_some() { n } else { 0 }];
         for f in flag.iter_mut() {
             *f = usize::MAX;
         }
@@ -326,6 +334,9 @@ impl SparseLdlt {
                 let i = pattern[idx];
                 let yi = y[i];
                 y[i] = 0.0;
+                if !dead.is_empty() && dead[i] {
+                    continue;
+                }
                 let start = lp[i];
                 let used = fill[i];
                 for p in start..start + used {
@@ -339,6 +350,16 @@ impl SparseLdlt {
                 fill[i] = used + 1;
             }
 
+            // Reporting mode: an EXACT zero is the same null direction as a near-zero one, decided
+            // by summation order alone (whether cancellation left 0.0 or one ulp), so it is recorded
+            // the same way. Aborting on it made the rank report depend on rounding.
+            if let Some(list) = collapsed.as_deref_mut() {
+                if d[k] == 0.0 || (scale > 0.0 && d[k].abs() < NEAR_ZERO_PIVOT_REL * scale) {
+                    list.push(k);
+                    dead[k] = true;
+                    continue;
+                }
+            }
             if d[k] == 0.0 {
                 return Err(LdltError::ZeroPivot(k));
             }
@@ -346,10 +367,6 @@ impl SparseLdlt {
             // magnitude the pivot's sign is rounding noise, and the sign pattern of D is the
             // matrix inertia, so a silent return here is a silently wrong eigenvalue count.
             if scale > 0.0 && d[k].abs() < NEAR_ZERO_PIVOT_REL * scale {
-                if let Some(list) = collapsed.as_deref_mut() {
-                    list.push(k);
-                    continue;
-                }
                 return Err(LdltError::NearZeroPivot {
                     column: k,
                     pivot: d[k],
